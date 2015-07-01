@@ -7,6 +7,8 @@ use Behance\NBD\Cache\Events\QueryFailEvent;
 
 use Behance\NBD\Cache\Interfaces\CacheAdapterInterface;
 
+use Behance\NBD\Cache\Exceptions\DuplicateActionException;
+
 use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 
@@ -16,6 +18,21 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
    * @var Symfony\Component\EventDispatcher\EventDispatcherInterface
    */
   protected $_dispatcher;
+
+  /**
+   * @var bool  indicates whether or not connection is in buffering mode
+   */
+  protected $_is_buffering = false;
+
+  /**
+   * @var array  queued operations to take place when committing buffer
+   */
+  protected $_buffered_ops;
+
+  /**
+   * @var array  acts as key-value storage during buffer operations
+   */
+  protected $_buffer;
 
 
   /**
@@ -40,7 +57,6 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
   abstract public function addServers( array $servers );
 
 
-
   /**
    * {@inheritDoc}
    */
@@ -60,7 +76,8 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
    */
   public function getMulti( array $keys ) {
 
-    $action = ( function() use ( $keys ) {
+    // NOTE: $keys are passed/used, since count/values may change in buffering mode
+    $action = ( function( $keys ) {
       return $this->_getMulti( $keys );
     } );
 
@@ -78,7 +95,7 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
       return $this->_set( $key, $value, $ttl );
     } );
 
-    return $this->_execute( $action, __FUNCTION__, $key, true );
+    return $this->_execute( $action, __FUNCTION__, $key, true, $value );
 
   } // set
 
@@ -92,7 +109,7 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
       return $this->_add( $key, $value, $ttl );
     } );
 
-    return $this->_execute( $action, __FUNCTION__, $key, true );
+    return $this->_execute( $action, __FUNCTION__, $key, true, $value );
 
   } // add
 
@@ -106,7 +123,7 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
       return $this->_replace( $key, $value, $ttl );
     } );
 
-    return $this->_execute( $action, __FUNCTION__, $key, true );
+    return $this->_execute( $action, __FUNCTION__, $key, true, $value );
 
   } // replace
 
@@ -122,7 +139,7 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
       return $this->_increment( $key, $value );
     } );
 
-    return $this->_execute( $action, __FUNCTION__, $key, true );
+    return $this->_execute( $action, __FUNCTION__, $key, true, $value );
 
   } // increment
 
@@ -136,7 +153,7 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
       return $this->_decrement( $key, $value );
     } );
 
-    return $this->_execute( $action, __FUNCTION__, $key, true );
+    return $this->_execute( $action, __FUNCTION__, $key, true, $value );
 
   } // decrement
 
@@ -167,6 +184,66 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
     return $this->_execute( $action, __FUNCTION__, $keys, true );
 
   } // deleteMulti
+
+
+  /**
+   * {@inheritDoc}
+   * @throws Behance\NBD\Cache\Exceptions\DuplicateActionException  when called while already buffering
+   */
+  public function beginBuffer() {
+
+    if ( $this->isBuffering() ) {
+      throw new DuplicateActionException( "Buffering already started" );
+    }
+
+    $this->_is_buffering = true;
+    $this->_buffered_ops = [];
+    $this->_buffer       = [];
+
+  } // beginBuffer
+
+
+  /**
+   * {@inheritDoc}
+   */
+  public function commitBuffer() {
+
+    foreach ( $this->_buffered_ops as $args ) {
+
+      // Unmarshal arguments to prepare for direct execution
+      list( $action, $operation, $key_or_keys, $mutable ) = $args;
+
+      $this->_performExecute( $action, $operation, $key_or_keys, $mutable );
+
+    } // foreach buffered_operations
+
+    // IMPORTANT: buffer is now committed, no longer in buffered mode
+    $this->_is_buffering = false;
+    $this->_bufferFlush();
+
+  } // commitBuffer
+
+
+  /**
+   * {@inheritDoc}
+   */
+  public function rollbackBuffer() {
+
+    // IMPORTANT: buffer is reverted, cache is untouched, no longer in buffered mode
+    $this->_is_buffering = false;
+    $this->_bufferFlush();
+
+  } // rollbackBuffer
+
+
+  /**
+   * {@inheritDoc}
+   */
+  public function isBuffering() {
+
+    return $this->_is_buffering;
+
+  } // isBuffering
 
 
   /**
@@ -238,7 +315,27 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
 
 
   /**
-   * Used to wrap every action with a before and after event
+   * When not buffering action is performed directly, otherwise, gets queued for execution
+   *
+   * @param \Closure        $action
+   * @param string          $operation
+   * @param string|string[] $key_or_keys
+   * @param bool            $mutable
+   * @param mixed           $value
+   *
+   * @return mixed
+   */
+  protected function _execute( \Closure $action, $operation, $key_or_keys, $mutable = false, $value = null ) {
+
+    return ( $this->isBuffering() )
+      ? $this->_performBufferedExecute( $action, $operation, $key_or_keys, $mutable, $value )
+      : $this->_performExecute( $action, $operation, $key_or_keys, $mutable );
+
+  } // _execute
+
+
+  /**
+   * Used to wrap every direct action with a before and after event
    *
    * @param \Closure        $action
    * @param string          $operation
@@ -247,17 +344,109 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
    *
    * @return mixed
    */
-  protected function _execute( \Closure $action, $operation, $key_or_keys, $mutable = false ) {
+  protected function _performExecute( \Closure $action, $operation, $key_or_keys, $mutable ) {
 
     $this->_emitQueryEvent( CacheAdapterInterface::EVENT_QUERY_BEFORE, $operation, $key_or_keys, $mutable );
 
-    $result = $action();
+    $result = $action( $key_or_keys );
 
     $this->_emitQueryEvent( CacheAdapterInterface::EVENT_QUERY_AFTER, $operation, $key_or_keys, $mutable );
 
     return $result;
 
-  } // _execute
+  } // _performExecute
+
+
+  /**
+   * Selectively performs actions as they may be experienced with the buffer committed,
+   * queues mutable actions for execution later
+   * IMPORTANT: unsupported operations return false
+   *
+   * @param \Closure        $action
+   * @param string          $operation
+   * @param string|string[] $key_or_keys
+   * @param bool            $mutable
+   * @param mixed           $value
+   *
+   * @return mixed
+   */
+  protected function _performBufferedExecute( \Closure $action, $operation, $key_or_keys, $mutable, $value ) {
+
+    switch ( $operation ) {
+
+      case 'get':
+
+        // Query operation results are important: if one exists in the current buffer, return it
+        // ...otherwise, this op is safe to pass through to execute, do *not* buffer
+        return ( $this->_bufferHasKey( $key_or_keys ) )
+               ? $this->_bufferGet( $key_or_keys )
+               : $this->_performExecute( $action, $operation, $key_or_keys, $mutable );
+
+      case 'getMulti':
+
+        // Combines results from buffered and actual cache outputs (unbuffered)
+        $buffered    = [];
+        $keys_to_get = [];
+
+        foreach ( $key_or_keys as $get_key ) {
+
+          if ( $this->_bufferHasKey( $get_key ) ) {
+            $buffered[ $get_key ] = $this->_bufferGet( $get_key );
+          }
+
+          else {
+            $keys_to_get[] = $get_key;
+          }
+
+        } // foreach key_or_keys
+
+        if ( !empty( $keys_to_get ) ) {
+          $unbuffered = $this->_performExecute( $action, $operation, $keys_to_get, $mutable );
+        }
+
+        $results = [];
+
+        foreach ( $key_or_keys as $get_key ) {
+
+          $results[ $get_key ] = ( isset( $buffered[ $get_key ] ) )
+                                 ? $buffered[ $get_key ]
+                                 : $unbuffered[ $get_key ];
+
+        } // foreach key_or_keys
+
+        return $results;
+
+      case 'set':
+        $this->_bufferSet( $key_or_keys, $value );
+        break;
+
+      case 'delete':
+        $this->_bufferSet( $key_or_keys, null );
+        break;
+
+      case 'deleteMulti':
+        foreach ( $key_or_keys as $delete_key ) {
+          $this->_bufferSet( $delete_key, null );
+        }
+        break;
+
+    } // switch operation
+
+    // If fall-through, add operation to buffer queue, which will be replayed in-order on commit
+    $this->_buffered_ops[] = [ $action, $operation, $key_or_keys, $mutable ];
+
+  } // _performBufferedExecute
+
+
+  /**
+   * Resets buffer to empty state
+   */
+  protected function _bufferFlush() {
+
+    $this->_buffered_ops = null;
+    $this->_buffer       = null;
+
+  } // _bufferFlush
 
 
   /**
@@ -308,6 +497,45 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
     return new EventDispatcher();
 
   } // _buildEventDispatcher
+
+
+  /**
+   * @param string $key
+   *
+   * @return mixed|bool  false to indicate key was deleted already
+   */
+  protected function _bufferGet( $key ) {
+
+    // IMPORTANT: if key exists but is null --- this is to indicate a DELETED key
+    return ( $this->_buffer[ $key ] === null )
+           ? false
+           : $this->_buffer[ $key ];
+
+  } // _bufferGet
+
+
+  /**
+   * @param string $key
+   * @param mixed  $value   set as null to indicate a DELETED key
+   */
+  protected function _bufferSet( $key, $value ) {
+
+    $this->_buffer[ $key ] = $value;
+
+  } // _bufferSet
+
+  /**
+   * Whether or not the local buffer contains the specified key
+   *
+   * @param string $key
+   *
+   * @return bool
+   */
+  protected function _bufferHasKey( $key ) {
+
+    return array_key_exists( $key, $this->_buffer );
+
+  } // _bufferHasKey
 
 
   /**
@@ -382,7 +610,9 @@ abstract class AdapterAbstract implements CacheAdapterInterface {
   abstract protected function _deleteMulti( array $keys );
 
 
+  /**
+   * Disconnect from server
+   */
   abstract protected function _close();
-
 
 } // AdapterAbstract

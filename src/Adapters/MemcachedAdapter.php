@@ -86,11 +86,12 @@ class MemcachedAdapter extends AdapterAbstract {
   /**
    * {@inheritDoc}
    */
-  protected function _execute( \Closure $action, $operation, $key_or_keys, $mutable = false ) {
+  protected function _execute( \Closure $action, $operation, $key_or_keys, $mutable = false, $value = null ) {
 
-    $result = parent::_execute( $action, $operation, $key_or_keys, $mutable );
+    $result = parent::_execute( $action, $operation, $key_or_keys, $mutable, $value );
     $code   = $this->_connection->getResultCode();
 
+    // TODO: handle when adapter is running in buffered mode
     if ( $code !== \Memcached::RES_SUCCESS ) {
       $this->_handleFailure( $this->_connection->getResultMessage(), null, null, $code );
     }

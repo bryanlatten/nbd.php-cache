@@ -59,6 +59,7 @@ interface CacheAdapterInterface {
    */
   public function add( $key, $value, $ttl = self::EXPIRATION_DEFAULT );
 
+
   /**
    * @param string $key
    * @param mixed  $value
@@ -101,6 +102,31 @@ interface CacheAdapterInterface {
    * @return bool
    */
   public function deleteMulti( array $keys );
+
+
+  /**
+   * Similar to a database transaction, when buffering, cache will not be altered visible
+   * to other connections until ->commitBuffer()
+   */
+  public function beginBuffer();
+
+
+  /**
+   * Processed any buffered actions so they may be seen by other connections
+   */
+  public function commitBuffer();
+
+
+  /**
+   * Cancels any mutable actions that took place during the buffering period
+   */
+  public function rollbackBuffer();
+
+
+  /**
+   * Whether or not connection is buffering
+   */
+  public function isBuffering();
 
 
   /**
