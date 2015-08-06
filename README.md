@@ -12,10 +12,20 @@ between [Memcache](https://pecl.php.net/package/memcached) and [Memcached](https
 
 ```
 use Behance\NBD\Cache\Factory;
-use Behance\NBD\Cache\Services\ConfigService;
 
-$config = new ConfigService();
-$config->addServer( [ 'host' => 'cache1.com', 'port' => 11211 ] );
+$config = [
+  [
+    'host' => 'cache1.com',
+    'port' => 11211
+  ],
+  [
+    'host' => 'cache2.com',
+    'port' => 11212
+  ],
+  //[
+  //  ... add as many servers as necessary
+  //]
+];
 
 // Creates an adapter based on the presence of memcache/memcached extensions
 $cache = Factory::create( $config );
